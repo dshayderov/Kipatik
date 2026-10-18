@@ -1,0 +1,27 @@
+fastapi==0.110.0
+uvicorn==0.27.1
+sqlalchemy==2.0.28
+asyncpg==0.29.0
+alembic==1.13.1
+pydantic==2.6.3
+pydantic-settings==2.2.1
+python-dotenv==1.0.1
+psycopg2-binary==2.9.9
+redis==5.0.3
+python-multipart==0.0.9
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt<4.0.0
+email-validator>=2.0.0
+GitPython==3.1.42
+httpx==0.27.0
+celery==5.3.6
+redis==5.0.3
+
+# Модели анализа кода (ЛР №1 и №3).
+# Ставится отдельной командой с CPU-индексом, иначе torch притянет
+# сборку с CUDA на ~2.5 ГБ:
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch
+#   pip install transformers numpy
+transformers>=4.40,<5
+numpy>=1.26

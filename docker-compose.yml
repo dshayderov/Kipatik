@@ -1,0 +1,103 @@
+# Развёртывание Kipatik.
+#
+# Образ бэкенда собирается из КОРНЯ репозитория: в него должны попасть
+# и код, и руководства из docs/. Отсюда context: . и путь к Dockerfile
+# с указанием backend/.
+#
+#   docker compose up -d db redis
+#   docker compose run --rm backend alembic upgrade head
+#   docker compose up -d backend
+#
+# Миграции вынесены отдельной командой намеренно: схема применяется
+# один раз при развёртывании, а не при каждом перезапуске контейнера.
+#
+# Фронтенд в этом файле не собирается. Он либо запускается отдельно
+# (npm run dev, порт 3000, обращается к бэкенду через прокси), либо
+# раздаётся статикой перед бэкендом — см. раздел «Развёртывание»
+# руководства администратора.
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: kipatik-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${POSTGRES_DB:-diplom}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Postgres сообщает о готовности раньше, чем начинает принимать
+    # соединения. Без проверки готовности бэкенд успевает упасть на
+    # старте, не дождавшись готовности базы.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-user} -d ${POSTGRES_DB:-diplom}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: kipatik-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        # torch не входит в requirements.txt. Включайте, только если
+        # в контейнер кладутся артефакты моделей (см. admin-guide,
+        # раздел «Нейросетевые модели»).
+        INSTALL_TORCH: "false"
+    container_name: kipatik-backend
+    restart: unless-stopped
+    # Настройки читаются из файла, а не из environment: список
+    # переменных один и тот же для контейнера и для запуска без
+    # Docker, иначе они разъезжаются.
+    env_file:
+      - backend/.env
+    environment:
+      # Переопределяет хост из .env: внутри сети compose адрес базы —
+      # имя сервиса, а не localhost.
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@db:5432/${POSTGRES_DB:-diplom}
+      REDIS_URL: redis://redis:6379/0
+      # Загруженные файлы переживают пересборку образа. Именно поэтому
+      # это именованный том, а не каталог внутри контейнера.
+      DOCS_DIR: /app/docs
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - uploads_data:/app/uploads
+      # Артефакты моделей. Раскомментировать и положить файлы в
+      # ./models, чтобы контейнер их видел:
+      #   - ./models:/app/models:ro
+      # и раскомментировать в environment:
+      #   CODE_MODEL_DIR: /app/models
+      #
+      # Раскладка в папке /app/models повторяет репозиторную:
+      #   code_model/commit_tracer.pt
+      #   code_model/type_classifier.pt
+      #   code_model/paraphrase-multilingual-mpnet-base-v2/
+      #   code_model/progress_estimator.py
+      # В образ словарь класть не нужно: он уже есть в репозитории,
+      # см. backend/scripts/fetch_tokenizer.py.
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  uploads_data:
