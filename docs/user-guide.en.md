@@ -380,7 +380,7 @@ Mentions are entered manually: the hint with the employee list does not appear. 
 
 «Создать ветку» (“Create branch”) creates a branch `feature/task-<номер задачи>-<фрагмент заголовка>` in the repository and automatically moves the task to the `IN PROGRESS` group. The button is available to the «Рук. проекта» (“Project Manager”), «Менеджер» (“Manager”) roles and to the task assignee.
 
-**The «Прогресс» (“Progress”) block** is first; details — in section 7.2. If there are no commits, «Оценка пока невозможна: к задаче не привязан ни один коммит» (“The estimate is not possible yet: not a single commit is linked to the task”) is shown.
+**The «Группы коммитов» (“Commit groups”) block** is first; details — in section 7.2. Groups are built from the confirmed commits of the task, show relations between commits and require human confirmation. The old progress estimate is no longer shown in the card: it measured volume, not the confirmed structure of the work.
 
 **The «Предложения (N)» (“Suggestions (N)”) section** — suggestions of the tracing model, see section 7.4; each one has «Принять» (“Accept”) and «Скрыть» (“Hide”).
 
@@ -562,20 +562,43 @@ If there are no unlinked events, “All Git events are linked!” is shown.
 
 The recommendation does not cancel the project rules: if the priority is marked with an asterisk and is not filled in, the task still will not be created.
 
-### 7.2 Progress estimate
+### 7.2 Commit groups and relations
 
-The «Прогресс» (“Progress”) block is first on the «Разработка» (“Development”) tab of the task card and appears when at least one commit is linked to the task.
+The «Группы коммитов» (“Commit groups”) block is first on the «Разработка» (“Development”) tab of the task card. It appears when at least two confirmed commits are linked to the task: there is nothing to group a single commit with.
+
+The system compares commits by the meaning of the changes, the message and the affected files, and builds connected groups. A group is a proposal, not a fact: until you click «Подтвердить» (“Confirm”), it is marked as a proposal.
 
 | Element | Content |
 |---|---|
-| Progress bar and percentage | Calculated estimate of readiness |
-| Confidence label | «уверенность высокая» (“confidence high”), «уверенность средняя» (“confidence medium”) or «уверенность низкая» (“confidence low”) |
-| «Почему такой процент?» (“Why this percentage?”) | Subtasks (X/Y), Volume (changed lines out of the expected ones), Focus (how many of the files named in the description are affected) |
-| «Что ограничивает точность» (“What limits the accuracy”) | Reasons: no linked commits, no subtasks, no files mentioned in the description, too little data for calibration |
-| Explanation of the source of the expected volume | Where the number of lines comes from: by project, by system or a default value |
-| «Динамика по дням» (“Dynamics by day”) | A chart of the volume accumulation by day |
+| Group name | The template “type — area”, for example “Fix — src/api”. The name can be changed manually |
+| Type badges | The commit types that make up the group |
+| “commits: N” | The group size; very large groups are split automatically |
+| “confidence N%” | The average confidence of the internal relations of the group |
+| Commit list | The short identifier, text and type of each commit |
+| Relations | How many relations of each type are inside the group |
+| «Граф» (“Graph”) | A diagram of the group relations: nodes are commits, labels on the lines are relation types |
+| “Ungrouped: N” | Commits that were not connected to any other commit; expand the row to see them |
 
-If there has been no activity with commits for at least four days, «Нет коммитов уже N дн.» (“There have been no commits for N days”) appears. If there are no commits at all, «Оценка пока невозможна: к задаче не привязан ни один коммит» (“The estimate is not possible yet: not a single commit is linked to the task”) is shown.
+**Four relation types:**
+
+| Relation | How to read it |
+|---|---|
+| related | The commits are close in meaning, but no type rule fired |
+| extends | The later commit continues or extends the earlier one |
+| fixes | The later commit fixes the earlier one |
+| tests | The later commit adds or changes tests for the earlier one |
+
+The “earlier → later” direction is determined by dates. If the dates are unknown, the relation remains “related”: the system does not guess what exactly is being fixed or tested.
+
+**Reading relations.** In the group card, expand the “Relations · N” row to see each pair of commits, the relation type and the confidence. The same data is available in the graph window: the lines are labelled with relation types, and the right-hand panel contains the complete list in the form “commit → commit · type · confidence”. The graph itself shows only the spanning tree (n−1 lines) to keep the diagram readable, so the full relation list may be longer than the graph.
+
+**Reading the graph.** The graph opens in a full-screen window: the diagram is on the left, the relations between commits are on the right. A node is a card with the short SHA and commit type; the node color matches the type, and the number in the corner is the number of links on the graph. Hover over a node to see the full message, and click it to open a panel below the graph with the full SHA, type, date, author, message, files and change statistics. The controls in the upper-right corner let you zoom in, zoom out or fit the graph. Hover over a relation in the list to highlight the corresponding line.
+
+**Confirmation and editing.** The «Подтвердить» (“Confirm”) button moves the group and its internal relations to the confirmed state; «Снять» (“Revoke”) returns the group to proposals. The pencil icon opens editing: you can change the name and mark the commits that belong to the group. At least two commits must remain in the group. Commits already occupied by another group are unavailable in the list — first remove them from that group if at least two commits will remain in it.
+
+**Rebuild.** The «Пересобрать» (“Rebuild”) button rebuilds the groups after commit types or the task composition change. It resets manual names, confirmations and edited members, so it asks for confirmation first.
+
+If the model is unavailable, groups are built from fallback lexical similarity; a warning appears under the block. If there are fewer than two commits, «Для группировки нужно минимум два привязанных коммита» (“At least two linked commits are required for grouping”) is shown.
 
 ### 7.3 Determining the commit type
 
@@ -606,13 +629,13 @@ Suggestions appear after the repository is synchronized and are updated on the n
 | Matches the meaning of the commit changes with the task texts and suggests a link | Whether to accept or hide each suggestion |
 | Determines the commit type by the meaning of the changes | Whether this type is correct, especially with a dimmed badge |
 | Recommends a priority when a task is created | Whether to keep the recommended priority or to set your own |
-| Calculates the progress percentage from the subtasks, the volume and the focus | Whether the estimate reflects the real state of the work |
+| Builds commit groups and relations between commits | Confirm groups, rename them and edit their members |
 
 The rules for working with automatic conclusions:
 
 1. Every conclusion has a confidence in percent. A low confidence is a signal to verify the result manually.
 2. With an uncertain type the type badge is dimmed and the «тип неуверенный» (“type uncertain”) mark appears next to it.
-3. The model only suggests: no link, no type and no estimate are applied to the task without a decision of a person.
+3. The model only suggests: no link, no type and no group is considered confirmed without a decision of a person.
 4. The accuracy of the conclusions is not guaranteed: the confidence percentages are an indicator, not an assessment of the quality of your work.
 
 ---
@@ -740,9 +763,11 @@ There is no password recovery in the system: the «Забыли пароль?» 
 4. Check the «Разработка» (“Development”) tab of the needed task, the «Отклонённые» (“Rejected”) section — the suggestion may have been hidden earlier.
 5. Make sure the commit text contains a task number like `#15`, if the commit is supposed to be linked automatically.
 
-### Why does the task have no progress estimate?
+### Why does the task have no commit groups?
 
-The estimate appears only when at least one commit is linked to the task. The message «Оценка пока невозможна: к задаче не привязан ни один коммит» (“The estimate is not possible yet: not a single commit is linked to the task”) means exactly that. Link the commits on the «Разработка» (“Development”) tab.
+Groups appear only when at least two confirmed commits are linked to the task. The message «Для группировки нужно минимум два привязанных коммита» (“At least two linked commits are required for grouping”) means exactly that. Link the commits on the «Разработка» (“Development”) tab.
+
+If there are enough commits but the block says “Groups have not been built yet”, click «Пересобрать» (“Rebuild”) or refresh the card. If the groups were built but all commits are “ungrouped”, no semantic relations were found: confirm the link manually or rebuild the groups after clarifying the types.
 
 ### The model suggested linking the wrong commit
 

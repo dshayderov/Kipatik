@@ -106,14 +106,17 @@ class Settings(BaseSettings):
     # здесь стоял относительный путь, и запуск не из папки backend
     # находил артефакты и молча работал без моделей.
     #
-    # Внутри неё папка code_model с артефактами обеих моделей:
-    #   code_model/commit_tracer.pt
+    # Внутри неё папка code_model с артефактами моделей:
+    #   code_model/student_model_fp16.pt
     #   code_model/type_classifier.pt
-    #   code_model/<имя модели>/        конфиг и словарь
+    #   code_model/student_model/       конфиг и словарь
     #   code_model/progress_estimator.py
+    #
+    # Старый commit_tracer.pt оставлен как резерв: загрузчик определяет
+    # архитектуру по ключам state_dict, поэтому оба файла совместимы.
     CODE_MODEL_DIR: str = ""
-    # Относительное имя файла весов внутри папки weights/ своей модели
-    CODE_MODEL_TRACER_FILE: str = "commit_tracer.pt"
+    # Имя файла весов внутри папки code_model.
+    CODE_MODEL_TRACER_FILE: str = "student_model_fp16.pt"
     CODE_MODEL_CLASSIFIER_FILE: str = "type_classifier.pt"
 
     # auto | cpu | cuda
@@ -155,6 +158,23 @@ class Settings(BaseSettings):
     # на не прогретой модели занимает секунды: модель прогревается при
     # старте приложения отдельной фоновой задачей.
     CODE_MODEL_CLASSIFY: bool = True
+
+    # ------------------------------------------------------------------ #
+    # Группировка коммитов и отношения (ЛР №2)
+    #
+    # Группы строятся по подтверждённым коммитам задачи. Пороги взяты
+    # из версии 3 ноутбука: ниже первого пара коммитов вообще не
+    # считается кандидатом, ниже второго — не объединяется в группу.
+    # Значения вынесены в настройки, потому что шкала эмбеддингов
+    # зависит от весов кодировщика.
+    # ------------------------------------------------------------------ #
+    GIT_COMMIT_GROUPING_ENABLED: bool = True
+    GIT_COMMIT_GROUP_CANDIDATE_THRESHOLD: float = 0.45
+    GIT_COMMIT_GROUP_THRESHOLD: float = 0.60
+    # Верхняя граница группы: защита от «комка» из десятков коммитов.
+    GIT_COMMIT_GROUP_MAX_SIZE: int = 8
+    # Правило типа (fixes/tests) применяется только при такой близости.
+    GIT_COMMIT_GROUP_MIN_RULE_AFFINITY: float = 0.55
 
     # ------------------------------------------------------------------ #
     # Тексты изменений (нужны моделям анализа кода)

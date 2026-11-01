@@ -966,6 +966,158 @@ async def get_task_dev_card(
     )
 
 
+class GroupCommitOut(BaseModel):
+    id: int
+    sha: Optional[str] = None
+    message: Optional[str] = None
+    commit_type: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+class GroupRelationOut(BaseModel):
+    id: int
+    source_commit_id: int
+    target_commit_id: int
+    source_sha: Optional[str] = None
+    target_sha: Optional[str] = None
+    source_short: Optional[str] = None
+    target_short: Optional[str] = None
+    relation_type: str
+    confidence: float = 0.0
+    direction: str = "unknown"
+    rule: Optional[str] = None
+    type_source: str = "heuristic"
+    evidence: Optional[str] = None
+    status: str = "proposed"
+    in_graph: bool = False
+
+
+class CommitGroupOut(BaseModel):
+    id: int
+    title: str
+    title_source: str = "template"
+    title_type: Optional[str] = None
+    title_area: Optional[str] = None
+    description: Optional[str] = None
+    rationale: Optional[str] = None
+    confidence: Optional[float] = None
+    status: str = "proposed"
+    position: int = 0
+    size: int = 0
+    commits: List[GroupCommitOut] = []
+    relations: List[GroupRelationOut] = []
+    graph_relations: List[GroupRelationOut] = []
+
+
+class TaskGroupsResponse(BaseModel):
+    task_id: int
+    available: bool = False
+    reason: Optional[str] = None
+    model_used: Optional[str] = None
+    algorithm_version: Optional[str] = None
+    generated_at: Optional[str] = None
+    groups: List[CommitGroupOut] = []
+    ungrouped: List[GroupCommitOut] = []
+    summary: Dict[str, int] = {}
+
+
+class GroupUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    status: Optional[str] = None
+    commit_ids: Optional[List[int]] = None
+
+
+class GroupAnalyzeRequest(BaseModel):
+    force: bool = True
+
+
+@router.get("/task/{task_id}/groups", response_model=TaskGroupsResponse)
+async def get_task_commit_groups(
+    task_id: int,
+    ensure: bool = True,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+):
+    """Группы коммитов и отношения между ними для вкладки «Разработка».
+
+    Группы строятся при первом обращении и кэшируются. Названия и
+    подтверждение — отдельные действия человека; автоматика создаёт
+    только предложения.
+    """
+    from app.git.grouping import ensure_task_groups, serialize_task_groups
+
+    await _load_task_with_access(db, task_id, current_user)
+    if ensure:
+        await ensure_task_groups(db, task_id)
+    return await serialize_task_groups(db, task_id)
+
+
+@router.post("/task/{task_id}/groups/analyze", response_model=TaskGroupsResponse)
+async def analyze_task_commit_groups(
+    task_id: int,
+    body: GroupAnalyzeRequest = GroupAnalyzeRequest(),
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+):
+    """Пересобрать группы. force=true стирает ручные правки состава."""
+    from app.core.roles import Permission
+    from app.git.grouping import ensure_task_groups, serialize_task_groups
+    from app.tasks.api import get_member_and_check_permission
+
+    task = await _load_task_with_access(db, task_id, current_user)
+    await get_member_and_check_permission(
+        db, current_user.id, task.project_id, Permission.TASK_GIT_LINK
+    )
+
+    await ensure_task_groups(db, task_id, force=body.force)
+    return await serialize_task_groups(db, task_id)
+
+
+@router.patch("/task/{task_id}/groups/{group_id}", response_model=TaskGroupsResponse)
+async def update_task_commit_group(
+    task_id: int,
+    group_id: int,
+    body: GroupUpdateRequest,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+):
+    """Переименовать группу, подтвердить её или изменить состав.
+
+    Состав можно менять только коммитами этой задачи, ещё не входящими
+    в другую группу: иначе один коммит оказался бы в двух группах, и
+    журнал разработки стал бы противоречивым.
+    """
+    from app.core.roles import Permission
+    from app.git.grouping import serialize_task_groups, update_group
+    from app.git.models import CommitGroup
+    from app.tasks.api import get_member_and_check_permission
+
+    task = await _load_task_with_access(db, task_id, current_user)
+    await get_member_and_check_permission(
+        db, current_user.id, task.project_id, Permission.TASK_GIT_LINK
+    )
+
+    group = await db.get(CommitGroup, group_id)
+    if group is None or group.task_id != task_id:
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    try:
+        await update_group(
+            db,
+            group_id,
+            title=body.title,
+            status=body.status,
+            commit_ids=body.commit_ids,
+            user_id=current_user.id,
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Group not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return await serialize_task_groups(db, task_id)
+
+
 class PatchBackfillRequest(BaseModel):
     limit: Optional[int] = None
 
@@ -1084,6 +1236,10 @@ async def create_task_git_link(
         db, task.id, body.link_type, body.target_id,
         source="manual", created_by_id=current_user.id,
     )
+    if body.link_type == "commit":
+        from app.git.grouping import invalidate_task_grouping
+
+        await invalidate_task_grouping(db, task.id)
     await db.commit()
 
     link = (
@@ -1149,6 +1305,11 @@ async def delete_task_git_link(
         obj = (await db.execute(select(PullRequest).filter(PullRequest.id == link.target_id))).scalar_one_or_none()
         if obj and obj in task.pull_requests:
             task.pull_requests.remove(obj)
+
+    if link.link_type == "commit":
+        from app.git.grouping import invalidate_task_grouping
+
+        await invalidate_task_grouping(db, task_id)
 
     await db.delete(link)
     await db.commit()
@@ -1692,6 +1853,9 @@ async def decide_suggestion(
                         task_id=link.task_id, commit_id=link.target_id
                     )
                 )
+            from app.git.grouping import invalidate_task_grouping
+
+            await invalidate_task_grouping(db, link.task_id)
 
         await db.commit()
 
@@ -1726,6 +1890,9 @@ async def decide_suggestion(
     link.created_by_id = current_user.id
 
     if link.link_type == "commit":
+        from app.git.grouping import invalidate_task_grouping
+
+        await invalidate_task_grouping(db, link.task_id)
         await db.execute(
             task_commits.delete().where(
                 task_commits.c.task_id == link.task_id,
@@ -1742,6 +1909,7 @@ class CommitTypeBackfillResult(BaseModel):
     status: str
     examined: int = 0
     classified: int = 0
+    reclassified: int = 0
     failed: int = 0
 
 
@@ -1749,13 +1917,15 @@ class CommitTypeBackfillResult(BaseModel):
 async def backfill_commit_types(
     repository_id: int,
     limit: Optional[int] = None,
+    force: bool = False,
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user),
 ):
-    """Определить тип для привязанных коммитов, у которых его ещё нет.
+    """Определить тип для привязанных коммитов.
 
-    Нужно для коммитов, привязанных до включения классификатора, и для
-    тех, чей тип не удалось посчитать в момент привязки.
+    Без force заполняются только коммиты без типа. force пересчитывает
+    выбранные коммиты новыми весами: без него замена классификатора не
+    изменила бы исторические записи.
     """
     result = await db.execute(
         select(GitRepository).where(GitRepository.id == repository_id)
@@ -1769,6 +1939,36 @@ async def backfill_commit_types(
     from app.git.commit_types import backfill_commit_types as _backfill
 
     stats = await _backfill(
-        db, repo_id=repository_id, limit=max(1, min(limit or 50, 200))
+        db,
+        repo_id=repository_id,
+        limit=max(1, min(limit or 50, 200)),
+        force=force,
     )
+
+    if stats.get("classified"):
+        # Типы входят в отношения fixes/tests и в название группы. После
+        # любого пересчёта старые группы описывают уже другую картину,
+        # поэтому сбрасываем кэш: при следующем открытии они соберутся
+        # заново.
+        from app.git.grouping import invalidate_task_groupings
+        from app.git.models import TaskGitLink
+
+        task_ids = (
+            (
+                await db.execute(
+                    select(TaskGitLink.task_id)
+                    .join(Commit, Commit.id == TaskGitLink.target_id)
+                    .where(
+                        Commit.repository_id == repository_id,
+                        TaskGitLink.link_type == "commit",
+                        TaskGitLink.status.notin_(("proposed", "rejected")),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        await invalidate_task_groupings(db, task_ids)
+        await db.commit()
+
     return CommitTypeBackfillResult(status="success", **stats)

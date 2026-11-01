@@ -106,6 +106,35 @@ except Exception as exc:
     check(False, "YAML не разбирается", f"{type(exc).__name__}: {exc}")
 
 # ================================================================ #
+# 2a. Миграции Alembic
+# ================================================================ #
+print("\n=== 2a. Миграции Alembic ===")
+
+versions_dir = os.path.join(BACKEND, "alembic", "versions")
+revisions = {}
+downs = {}
+for name in sorted(os.listdir(versions_dir)):
+    if not name.endswith(".py"):
+        continue
+    text = io.open(os.path.join(versions_dir, name), encoding="utf-8").read()
+    rev = re.search(r"^revision:\s*str\s*=\s*['\"]([^'\"]+)", text, re.M)
+    down = re.search(r"^down_revision:.*?=\s*['\"]([^'\"]+)", text, re.M)
+    if rev:
+        revisions.setdefault(rev.group(1), []).append(name)
+        downs[rev.group(1)] = down.group(1) if down else None
+
+duplicates = {key: value for key, value in revisions.items() if len(value) > 1}
+check(not duplicates, "нет повторяющихся revision id", duplicates or "")
+children = {value for value in downs.values() if value}
+heads = [key for key in revisions if key not in children]
+check(len(heads) == 1, "у миграций ровно одна голова", heads)
+check(
+    downs.get("f9a0b1c2d3e4") == "c1d2e3f4a5b6",
+    "миграция групп продолжает текущую голову",
+    downs.get("f9a0b1c2d3e4"),
+)
+
+# ================================================================ #
 # 3. Правила игнорирования — через сам git
 # ================================================================ #
 print("\n=== 3. Правила игнорирования (git check-ignore) ===")
@@ -130,6 +159,7 @@ def build_sandbox():
         "backend/uploads/avatar.png",
         "forwork/1_note.ipynb",
         "backend/app/ai/code_model/commit_tracer.pt",
+        "backend/app/ai/code_model/student_model_fp16.pt",
         "backend/app/ai/code_model/type_classifier.pt",
         "frontend/dist/index.html",
         "backend/alembic/versions/cdaf42149890_init.py",
@@ -146,6 +176,9 @@ def build_sandbox():
         placeholders.append(
             "backend/app/ai/code_model/"
             "paraphrase-multilingual-mpnet-base-v2/" + name)
+    for name in ("tokenizer.json", "config.json", "tokenizer_config.json"):
+        placeholders.append(
+            "backend/app/ai/code_model/student_model/" + name)
 
     for rel in placeholders:
         if rel in (".gitignore", ".gitattributes"):
@@ -239,7 +272,9 @@ else:
         # Веса моделей лежат в репозитории: клонирование должно давать
         # готовый комплект. Исключать их больше нельзя — развёртывание
         # требовало вручную куда-то класть гигабайтный файл.
-        ("backend/app/ai/code_model/commit_tracer.pt", "веса кодировщика"),
+        ("backend/app/ai/code_model/commit_tracer.pt", "резервные веса кодировщика"),
+        ("backend/app/ai/code_model/student_model_fp16.pt",
+         "веса student-кодировщика"),
         ("backend/app/ai/code_model/type_classifier.pt",
          "веса классификатора"),
         (".gitattributes", "правила хранения весов в LFS"),
@@ -265,7 +300,11 @@ else:
         p = ("backend/app/ai/code_model/"
              f"paraphrase-multilingual-mpnet-base-v2/{name}")
         rule = ignored(p)
-        check(not rule, f"НЕ игнорируется: токенизатор/{name}", rule or p)
+        check(not rule, f"НЕ игнорируется: старый токенизатор/{name}", rule or p)
+    for name in ("tokenizer.json", "config.json", "tokenizer_config.json"):
+        p = f"backend/app/ai/code_model/student_model/{name}"
+        rule = ignored(p)
+        check(not rule, f"НЕ игнорируется: student-токенизатор/{name}", rule or p)
 
     # ───────────────────────────────────────────────────────────── #
     # Веса хранятся через Git LFS. Проверяется именно результат
@@ -278,7 +317,9 @@ else:
     # оттуда нельзя.
     print("\n=== 3a. Веса хранятся через Git LFS ===")
     for rel, what in [
-        ("backend/app/ai/code_model/commit_tracer.pt", "веса кодировщика"),
+        ("backend/app/ai/code_model/commit_tracer.pt", "резервные веса кодировщика"),
+        ("backend/app/ai/code_model/student_model_fp16.pt",
+         "веса student-кодировщика"),
         ("backend/app/ai/code_model/type_classifier.pt",
          "веса классификатора"),
     ]:

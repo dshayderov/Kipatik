@@ -3,16 +3,17 @@
 Зачем нужен этот скрипт
 -----------------------
 
-В чекпоинте ``commit_tracer.pt`` лежат **только веса**. Архитектуры
-ни в чекпоинте, ни в коде нет: модель собирается через
-``from_config``, а архитектура берётся из ``config.json`` и словарь —
-из ``tokenizer.json``. Без них кодировщик не запустится, и страница
-управления моделями покажет причину ``tokenizer_missing``.
+В чекпоинтах лежат **только веса**. Архитектуры ни в чекпоинте, ни в
+коде нет: модель собирается через ``from_config``, а архитектура
+берётся из ``config.json`` и словарь — из ``tokenizer.json``. Без них
+кодировщик не запустится, и страница управления моделями покажет
+причину ``tokenizer_missing``.
 
-В ноутбуке это происходило само собой через
-``AutoModel.from_pretrained(MODEL_NAME)``, но такой вызов тянет 1.11 ГБ
-весов, чтобы тут же их затёрть. Здесь скачивается только нужное:
-конфиг, словарь и модель sentencepiece — около 13 МБ.
+Основной кодировщик — студент MiniLM (``student_model_fp16.pt``):
+его конфиг и словарь лежат в ``student_model/`` и уже в репозитории.
+Этот скрипт восстанавливает словарь **старого резервного** mpnet,
+если понадобится откатиться на ``commit_tracer.pt``. Скачивается
+только нужное: конфиг, словарь и модель sentencepiece — около 13 МБ.
 
 Почему папка словаря под контролем версий
 -----------------------------------------
@@ -40,9 +41,8 @@ import sys
 import urllib.error
 import urllib.request
 
-# Имя папки с конфигом и словарём внутри app/ai/encoder/tokenizer/.
-# Должно совпадать с TOKENIZER_SUBDIR в app/ai/encoder/service.py —
-# иначе кодировщик будет искать папку, которой нет.
+# Папка старого резервного кодировщика mpnet. Она должна совпадать с
+# LEGACY_TOKENIZER_SUBDIR в app/ai/api.py.
 MODEL_SUBDIR = "paraphrase-multilingual-mpnet-base-v2"
 
 BASE_URL = (
@@ -157,7 +157,7 @@ def main() -> int:
     print(f"Готово: {human(size)} в {target}")
     print()
     print("Осталось положить веса моделей — скрипт их не качает:")
-    for name in (settings_names := ("commit_tracer.pt", "type_classifier.pt")):
+    for name in ("student_model_fp16.pt", "type_classifier.pt"):
         print(f"  {os.path.join(BACKEND, 'app', 'ai', 'code_model', name)}")
     return 0
 

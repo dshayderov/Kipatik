@@ -25,7 +25,7 @@ import {
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import api from '../api/client';
-import ProgressBlock from './ProgressBlock';
+import CommitGroups from './CommitGroups';
 import { TASK_TYPE_STYLE, type TaskType } from '../types/taskType';
 
 interface Props {
@@ -288,9 +288,13 @@ const isEmpty =
 
   return (
     <div className="space-y-5">
-      {/* Оценка прогресса — над разработкой, потому что это итог,
-          а детали ниже его обосновывают */}
-      <ProgressBlock taskId={card.task_id} />
+      {/* Группы коммитов — над остальными разделами: это структура
+          работы, а не оценка объёма. */}
+      <CommitGroups
+        taskId={card.task_id}
+        commits={card.commits}
+        canEdit={canEdit}
+      />
 
       {/* Предложения модели: пока не подтверждены, в «Коммиты» не попадают */}
       {repoId && suggestions.length > 0 && (

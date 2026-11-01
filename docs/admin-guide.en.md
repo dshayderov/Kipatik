@@ -248,35 +248,42 @@ In the user-facing project participants window, changing a role with a dropdown 
 
 ## 6. Neural models
 
-The «Управление нейросетевыми моделями» (“Neural model management”) section is the only place where code analysis and work volume estimation models are enabled, unloaded, and warmed up.
+The «Управление нейросетевыми моделями» (“Neural model management”) section is the only place where code analysis, grouping, and work volume estimation models are enabled, unloaded, and warmed up.
 
 ### 6.1 Which models exist and what each one does
 
 | Model | Kind | Purpose | Dependencies |
 |---|---|---|---|
-| Trace encoder | Neural network | Converts commit messages and task texts into vectors and uses them to pick a task for a commit. The heaviest part: about a gigabyte of weights, kept in memory permanently | — |
+| Trace encoder | Neural network | Converts commit messages and task texts into vectors and uses them to pick a task for a commit. The main weights are student MiniLM, about 236 MB | — |
 | Commit type classifier | Neural network | Determines the type of a commit from the meaning of the changes: fix, feature, refactoring, documentation, tests, other | Works on top of the encoder, cannot be enabled separately |
-| Work volume estimation | Rules | Calculates task progress from the volume of changes, subtasks, and files named in the description. No neural network is used | — |
+| Commit grouping | Neural network and rules | Builds groups of related commits and `related`, `extends`, `fixes`, `tests` relations. Groups are proposals until a person confirms them | Uses encoder embeddings; falls back to lexical similarity when the model is unavailable |
+| Work volume estimation | Rules | A service estimate from the volume of changes, subtasks, and files. It is no longer shown in the task card: commit groups have taken its place | — |
 
 At the top of the page there are three metrics: the total volume of artifacts on disk, how many models are loaded in memory right now, and how many are enabled.
+
+Grouping has no separate card: it uses the encoder embeddings and works while the model is available. If the encoder is disabled or fails to load, grouping does not crash; it falls back to lexical similarity and marks this in the task card.
 
 ### 6.2 Artifacts and where they live
 
 | Artifact | Default name | Size | What it is |
 |---|---|---|---|
-| Encoder weights | `commit_tracer.pt` | ≈ 1061 MB | The main weights of the matching model |
+| Encoder weights | `student_model_fp16.pt` | ≈ 236 MB | The main weights of the student matching model |
 | Classifier weights | `type_classifier.pt` | ≈ 0.8 MB | Only the “head” of the classifier on top of the frozen encoder |
-| Tokenizer folder | `paraphrase-multilingual-mpnet-base-v2` | ≈ 13.5 MB | Five files: architecture configuration, vocabulary, and its description |
+| Tokenizer folder | `student_model` | ≈ 17 MB | BERT architecture configuration and the student vocabulary |
+| Reserve weights | `commit_tracer.pt` | ≈ 1061 MB | The old mpnet encoder; kept for rollback |
+| Reserve vocabulary | `paraphrase-multilingual-mpnet-base-v2` | ≈ 13.5 MB | Configuration and vocabulary of the old encoder |
 
-Where to get the files: they are in the repository, in the `code_model` folder next to the code, that is `backend/app/ai/code_model`. Cloning gives a complete set — the weights of both models, the progress rules module, and the vocabulary folder. There is nothing to download or place by hand. The root is overridden by the `CODE_MODEL_DIR` variable, the weight file names by the `CODE_MODEL_TRACER_FILE` and `CODE_MODEL_CLASSIFIER_FILE` variables; the vocabulary folder name is fixed.
+Where to get the files: they are in the repository, in the `code_model` folder next to the code, that is `backend/app/ai/code_model`. Cloning gives a complete set — the student weights, the type classifier, the rules module, and the vocabulary folder. There is nothing to download or place by hand. The old `commit_tracer.pt` and mpnet vocabulary are kept as a reserve: the loader detects the architecture from the checkpoint, so a rollback is done by changing `CODE_MODEL_TRACER_FILE`.
+
+The root is overridden by the `CODE_MODEL_DIR` variable, the weight file names by the `CODE_MODEL_TRACER_FILE` and `CODE_MODEL_CLASSIFIER_FILE` variables. The main vocabulary folder is `student_model`; the old reserve vocabulary folder is `paraphrase-multilingual-mpnet-base-v2`.
 
 Critically important:
 
-- **The weight files contain only the weights.** The model architecture and the vocabulary are taken from the tokenizer folder. Without it the model **will not start**: the panel will show the «файл не найден» (“file not found”) badge, and diagnostics will show the reason `tokenizer_missing`.
-- **The vocabulary and the weights are in the repository.** Cloning gives a complete set. If the vocabulary is ever lost it can be restored on its own: `python backend/scripts/fetch_tokenizer.py`; a check without downloading is `python backend/scripts/fetch_tokenizer.py --check`.
-- **The large weights are stored with Git LFS.** The encoder weighs about a gigabyte, and GitHub has a hard limit of 100 MB per file, so it cannot be pushed with plain git. Cloning a repository without LFS succeeds, but the files stay as small pointers and the model reports `tracer_missing`. Run `git lfs install` before cloning; check the state with `git lfs ls-files`.
+- **The weight files contain only the weights.** The model architecture and the vocabulary are taken from the `student_model` folder. Without it the model **will not start**: the panel will show the «файл не найден» (“file not found”) badge, and diagnostics will show the reason `tokenizer_missing`.
+- **The vocabulary and the weights are in the repository.** Cloning gives a complete set: the student weights, the type classifier, the rules module, and the vocabulary folder. There is nothing to download or lay out by hand. The script `python backend/scripts/fetch_tokenizer.py` restores only the vocabulary of the **old reserve** mpnet; a check without downloading is `python backend/scripts/fetch_tokenizer.py --check`.
+- **The large weights are stored with Git LFS.** The student encoder weighs about 236 MB and the old reserve about a gigabyte, while GitHub has a hard limit of 100 MB per file, so they cannot be pushed with plain git. Cloning a repository without LFS succeeds, but the files stay as small pointers and the model reports `tracer_missing`. Run `git lfs install` before cloning; check the state with `git lfs ls-files`.
 - **`torch` is required, and it is not in the server dependency list.** It is installed with a separate command given in the dependency file itself: first `torch` from the CPU index, then `transformers` and `numpy`. Without it the Docker image will build and start, but it will not be able to work with models: the page will show that the artifacts are in place, and the load will end with an import error. Full `torch` pulls in a build with video support of about 2.5 GB — therefore the CPU variant is recommended. A separate build argument is provided for building the image, which adds `torch` to the image; without it the image runs without models, and that is a deliberate decision.
-- The models take about 1.1 GB of disk space and about 1.6 GB of RAM when running on CPU. Check the free disk and memory before enabling them.
+- The main set takes about 250 MB of disk space instead of the previous 1.1 GB. RAM is still needed with a margin: `torch` and a loaded encoder take noticeably more than the weight file itself. Check the free disk and memory before enabling them.
 
 ### 6.3 Enabling and disabling
 
@@ -558,18 +565,24 @@ location /        { try_files $uri $uri/ /index.html; }
 
 ### 9.1.2 Model artifacts in production mode
 
-The server image is built **without** the model weights: the encoder weighs
-about a gigabyte, and there is no reason to put it in the image on every run.
-The artifacts are connected separately and survive a rebuild of the image.
+The server image is built **without** the model weights: even the new encoder
+weighs about 236 MB, and the reserve about a gigabyte, so there is no reason to
+put them in the image on every run. The artifacts are connected separately and
+survive a rebuild of the image.
 
 Put the files in a folder outside the repository; the layout repeats the model
 structure in the project:
 
 ```
-models/code_model/commit_tracer.pt
+models/code_model/student_model_fp16.pt
 models/code_model/type_classifier.pt
+models/code_model/student_model/
+models/code_model/commit_tracer.pt
 models/code_model/paraphrase-multilingual-mpnet-base-v2/
 ```
+
+The first three lines are enough for operation; the last two are needed only
+for a rollback to the old encoder.
 
 Then in `docker-compose.yml` uncomment the mount and set
 the root:
@@ -604,7 +617,7 @@ simply not performed. This is deliberate behaviour, not a failure — see sectio
 
 Two deployment options: Docker Compose — three services are brought up (a PostgreSQL 16 database, Redis 7, and the application server on port 8000); manual installation — Python 3.10 or newer, Node.js 18 or newer, PostgreSQL, and Redis.
 
-Resources: about 1.1 GB of disk for the model artifacts, if they are used, and about 1.6 GB of RAM above the usual consumption with the encoder loaded. A video card is not required: the models run on CPU, the default setting is auto-detection, and if resources are short you can force CPU. Git is needed both by the server and by users.
+Resources: about 250 MB of disk for the main model set (the reserve old weights add about another 1.1 GB if kept). RAM needs a margin above the usual consumption: `torch` and a loaded encoder take noticeably more than the weight file itself. A video card is not required: the models run on CPU, the default setting is auto-detection, and if resources are short you can force CPU. Git is needed both by the server and by users.
 
 ### 9.2 Environment variables
 
@@ -706,32 +719,41 @@ While these variables are empty, a fallback path is available — manual entry o
 | `PROGRESS_CALIBRATION_PRIOR_STRENGTH` | `3` | Prior strength: the data weight equals `n / (n + strength)`, where `n` is the number of observations |
 | `PROGRESS_HISTORY_DAYS` | `30` | How many days to show in the progress dynamics |
 
+The volume estimate remains a server-side calculation and is available via the API, but it is no longer shown in the task card. Commit groups and relations, which a person confirms or edits, have taken its place.
+
 #### 9.2.7 Code analysis models
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `CODE_MODEL_ENABLED` | `True` | Master switch for code analysis models; the default value for the encoder |
 | `CODE_MODEL_DIR` | empty — search next to the code | The root in which the model folders live. Set it only if the artifacts are not there |
-| `CODE_MODEL_TRACER_FILE` | `commit_tracer.pt` | The encoder weights file name |
+| `CODE_MODEL_TRACER_FILE` | `student_model_fp16.pt` | The encoder weights file name |
 | `CODE_MODEL_CLASSIFIER_FILE` | `type_classifier.pt` | The classifier weights file name |
 | `CODE_MODEL_DEVICE` | `auto` | Compute device: `auto`, `cpu`, or `cuda` |
 | `CODE_MODEL_TRACE_THRESHOLD` | `0.30` | Threshold for linking a commit to a task. Below the threshold the decision stays with the person |
 | `CODE_MODEL_TRACE_LIMIT` | `20` | How many project tasks to consider when matching |
-| `CODE_MODEL_TRACE_BUDGET_SECONDS` | `5.0` | Time budget for one commit in a bulk run |
-| `GIT_TRACE_ON_SYNC` | `False` | Tracing by meaning during the background sync |
-| `GIT_TRACE_SYNC_LIMIT` | `10` | How many commits to trace in one pass |
-| `GIT_TRACE_FETCH_PATCHES` | `False` | Whether to fetch the diff texts right during tracing |
+| `CODE_MODEL_TRACE_BUDGET_SECONDS` | `5.0` | Time budget per commit during a bulk run |
+| `GIT_TRACE_ON_SYNC` | `False` | Semantic tracing during background synchronization |
+| `GIT_TRACE_SYNC_LIMIT` | `10` | How many commits to trace per pass |
+| `GIT_TRACE_FETCH_PATCHES` | `False` | Whether to fetch change texts during tracing |
 | `CODE_MODEL_CLASSIFY` | `True` | Determine the commit type when linking to a task |
+| `GIT_COMMIT_GROUPING_ENABLED` | `True` | Build commit groups on the «Разработка» (“Development”) tab |
+| `GIT_COMMIT_GROUP_CANDIDATE_THRESHOLD` | `0.45` | The lower similarity threshold at which a pair of commits is considered a candidate |
+| `GIT_COMMIT_GROUP_THRESHOLD` | `0.60` | The threshold at which a pair joins the same group |
+| `GIT_COMMIT_GROUP_MAX_SIZE` | `8` | The maximum group size; larger groups are split |
+| `GIT_COMMIT_GROUP_MIN_RULE_AFFINITY` | `0.55` | The minimum similarity for the `fixes` and `tests` rules; below it only `related` is used |
 
 The values of these variables are only the **defaults**. Once you have made a decision on the models page, the database decides, not the file (section 6.3); the «изменено» (“modified”) badge shows where the decisions differ.
 
-The artifacts of both models lie in one folder `app/ai/code_model`:
+The model artifacts lie in one folder `app/ai/code_model`:
 
 ```
-app/ai/code_model/commit_tracer.pt                      веса трассировки
-app/ai/code_model/type_classifier.pt                    веса типов
-app/ai/code_model/progress_estimator.py                 модуль правил
-app/ai/code_model/paraphrase-multilingual-mpnet-base-v2/  конфиг и словарь
+app/ai/code_model/student_model_fp16.pt                   tracing weights
+app/ai/code_model/type_classifier.pt                      type weights
+app/ai/code_model/progress_estimator.py                   rules module
+app/ai/code_model/student_model/                          config and vocabulary
+app/ai/code_model/commit_tracer.pt                        old reserve
+app/ai/code_model/paraphrase-multilingual-mpnet-base-v2/  reserve vocabulary
 ```
 
 `CODE_MODEL_DIR` sets the root inside which the `code_model` folder is searched for. An empty value means “search next to the code”: the path does not depend on which folder the server was started from. In a container, set it explicitly if the artifacts are connected by mounting — for example `/app/models`.
@@ -879,7 +901,7 @@ If auto-cleanup is turned off, the first step stops running as well: unattached 
 | 2 | Check the tokenizer folder | It must lie next to the weights and contain five files; without it the model will not start |
 | 3 | Check the `torch` installation | It is installed separately; in the image it is enabled with a build argument |
 | 4 | Look at the state through the diagnostic request | The reason for unavailability decodes the problem: disabled, no tokenizer folder, no encoder or classifier weights |
-| 5 | Check the available memory | The encoder requires about 1.6 GB; if memory is short, the load aborts |
+| 5 | Check the available memory | A loaded encoder and `torch` take noticeably more memory than the weight file; if memory is short, the load aborts |
 | 6 | Check the device setting | With automatic selection the server may take the video card; if resources are short, specify `cpu` |
 | 7 | Click «Загрузить» (“Load”) on the models page | Warm-up of the enabled models again |
 | 8 | Restart the server | Helps after unloading: repeated loading in the same process is unreliable |

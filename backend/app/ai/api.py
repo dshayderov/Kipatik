@@ -15,13 +15,15 @@
 
 Артефакты лежат рядом, в папке code_model/:
 
-    code_model/commit_tracer.pt                     веса трассировки
+    code_model/student_model_fp16.pt                веса трассировки
     code_model/type_classifier.pt                   веса типов
     code_model/progress_estimator.py                модуль правил
-    code_model/paraphrase-multilingual-mpnet-base-v2/  конфиг и словарь
+    code_model/student_model/                       конфиг и словарь
 
 В файлах весов лежат только веса. Архитектура и словарь берутся из
-папки с моделью mpnet: без неё кодировщик не запустится.
+папки student_model: без неё кодировщик не запустится. Старый
+commit_tracer.pt (mpnet) поддерживается как резерв — архитектура
+определяется по ключам state_dict, а не по имени файла.
 
 Загрузка ленивая: импорт этого модуля не тянет за собой torch и не
 читает гигабайтный файл. Выключенная модель вообще не поднимается.
@@ -132,7 +134,10 @@ def overrides() -> Dict[str, bool]:
 
 # Имя папки с конфигом и словарём кодировщика. Должно совпадать
 # с именем, под которым словарь кладёт scripts/fetch_tokenizer.py.
-TOKENIZER_SUBDIR = "paraphrase-multilingual-mpnet-base-v2"
+# Новый студент (MiniLM) использует собственный словарь; mpnet оставлен
+# для резервных весов commit_tracer.pt.
+TOKENIZER_SUBDIR = "student_model"
+LEGACY_TOKENIZER_SUBDIR = "paraphrase-multilingual-mpnet-base-v2"
 
 
 def model_root() -> Path:
@@ -159,14 +164,27 @@ def code_model_dir() -> Path:
     return model_root() / ARTIFACT_DIR
 
 
-def tokenizer_dir() -> Path:
+def tokenizer_dir(subdir: Optional[str] = None) -> Path:
     """Папка с конфигом и словарём кодировщика.
 
     Словарь принадлежит кодировщику, но лежит в общей папке: он нужен
     обоим моделям, потому что классификатор считает поверх
     эмбеддингов кодировщика.
     """
-    return code_model_dir() / TOKENIZER_SUBDIR
+    return code_model_dir() / (subdir or TOKENIZER_SUBDIR)
+
+
+def _tokenizer_subdir_for(path: Optional[Path]) -> str:
+    """Словарь подбирается по имени файла весов.
+
+    Для нового студента это student_model, для старого резервного
+    tracer — mpnet. После чтения state_dict решение уточняется по
+    ключам: имена файлов можно переименовать, архитектуру — нет.
+    """
+    name = (path.name if path else "").lower()
+    if "commit_tracer" in name or "mpnet" in name:
+        return LEGACY_TOKENIZER_SUBDIR
+    return TOKENIZER_SUBDIR
 
 
 def artifact_path(key: str) -> Optional[Path]:
@@ -270,11 +288,12 @@ def all_descriptions() -> List[dict]:
 
 logger = logging.getLogger(__name__)
 
+# sentencepiece.bpe.model нужен только старым весам mpnet, новому
+# студенту достаточно tokenizer.json и config.json.
 TOKENIZER_FILES = (
     "tokenizer.json",
-    "sentencepiece.bpe.model",
     "tokenizer_config.json",
-    "special_tokens_map.json",
+    "config.json",
 )
 
 # Вклад семантики и пересечения файлов в общую оценку (ноутбук №1).
@@ -346,9 +365,9 @@ class EncoderService:
 
     # ---------------- состояние ----------------
     def artifacts(self) -> Dict:
-        base = tokenizer_dir()
-        missing = [n for n in TOKENIZER_FILES if not (base / n).exists()]
         weights = artifact_path(KEY_ENCODER)
+        base = tokenizer_dir(_tokenizer_subdir_for(weights))
+        missing = [n for n in TOKENIZER_FILES if not (base / n).exists()]
         return {
             "tokenizer_dir": str(base),
             "tokenizer_ready": not missing,
@@ -396,8 +415,19 @@ class EncoderService:
         return self._dim
 
     # ---------------- загрузка ----------------
-    def _build_encoder(self, config):
-        """Архитектура из локального config.json, без скачивания весов."""
+    def _build_encoder(self, config, student: bool, projection_dim: int = 768):
+        """Архитектура из локального config.json, без скачивания весов.
+
+        В репозитории лежат два несовместимых чекпоинта:
+
+        * старый `commit_tracer.pt` — mpnet, CLS-пул, dropout, без проекции;
+        * новый `student_model_fp16.pt` — MiniLM, mean-pooling и проекция
+          384 → 768 в пространство учителя.
+
+        Поэтому архитектура выбирается по ключам state_dict. Если
+        ошибиться, load_state_dict либо упадёт, либо молча загрузит
+        чужие веса в неверные слои — второй вариант хуже.
+        """
         # Импорт внутри функции: без него сам модуль оставался бы дешёвым
         # и не тянул torch при первом обращении.
         import torch.nn as nn
@@ -419,6 +449,34 @@ class EncoderService:
                         self.encode(positive_ids, positive_mask),
                         self.encode(negative_ids, negative_mask))
 
+        class StudentSimilarity(nn.Module):
+            def __init__(self, cfg, out_dim: int):
+                super().__init__()
+                self.encoder = AutoModel.from_config(cfg)
+                self.projection = nn.Linear(cfg.hidden_size, out_dim)
+                self.dropout = nn.Dropout(0.1)
+
+            @staticmethod
+            def _mean_pooling(last_hidden_state, attention_mask):
+                mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
+                summed = (last_hidden_state * mask).sum(dim=1)
+                return summed / mask.sum(dim=1).clamp(min=1e-9)
+
+            def encode(self, input_ids, attention_mask):
+                out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+                pooled = self._mean_pooling(
+                    out.last_hidden_state, attention_mask
+                )
+                return self.dropout(self.projection(pooled))
+
+            def forward(self, anchor_ids, anchor_mask, positive_ids, positive_mask,
+                        negative_ids, negative_mask):
+                return (self.encode(anchor_ids, anchor_mask),
+                        self.encode(positive_ids, positive_mask),
+                        self.encode(negative_ids, negative_mask))
+
+        if student:
+            return StudentSimilarity(config, projection_dim)
         return MultilingualSimilarity(config)
 
     def load(self) -> bool:
@@ -440,7 +498,6 @@ class EncoderService:
                 logger.info("Кодировщик недоступен: %s", st["reason"])
                 return False
 
-            tokenizer_path = tokenizer_dir()
             tracer_path = artifact_path(KEY_ENCODER)
 
             try:
@@ -456,25 +513,9 @@ class EncoderService:
                     logger.warning("CUDA недоступна, переключаюсь на CPU")
                     device = "cpu"
 
-                tokenizer = AutoTokenizer.from_pretrained(
-                    str(tokenizer_path), local_files_only=True
-                )
-                config = AutoConfig.from_pretrained(
-                    str(tokenizer_path), local_files_only=True
-                )
-
-                encoder = self._build_encoder(config)
-                # Веса читаются отображением файла в память, а параметры
-                # модели ссылаются прямо на них вместо копирования.
-                #
-                # Раньше было torch.load + load_state_dict, и последний
-                # копирует: в момент копирования в памяти живут и модель,
-                # и весь state_dict. Замер показал 2680 МБ против 1615 МБ
-                # при той же скорости — треть памяти уходила на копию,
-                # которая тут же выбрасывалась.
-                #
-                # mmap требует torch 2.1+, поэтому при отсутствии поддержки
-                # остаётся прежний путь: хуже по памяти, но работает.
+                # Сначала читаем state_dict: архитектура определяется
+                # по ключам, а не по имени файла. mmap требует torch 2.1+,
+                # поэтому при отсутствии поддержки остаётся обычная загрузка.
                 load_kwargs = {"map_location": "cpu", "weights_only": True}
                 try:
                     state = torch.load(str(tracer_path), mmap=True, **load_kwargs)
@@ -483,10 +524,40 @@ class EncoderService:
                     state = torch.load(str(tracer_path), **load_kwargs)
                     use_assign = False
 
-                try:
-                    encoder.load_state_dict(state, assign=use_assign)
-                finally:
+                keys = set(state.keys())
+                is_student = "projection.weight" in keys
+                tokenizer_path = tokenizer_dir(
+                    TOKENIZER_SUBDIR if is_student else LEGACY_TOKENIZER_SUBDIR
+                )
+
+                tokenizer = AutoTokenizer.from_pretrained(
+                    str(tokenizer_path), local_files_only=True
+                )
+                config = AutoConfig.from_pretrained(
+                    str(tokenizer_path), local_files_only=True
+                )
+
+                projection_dim = (
+                    int(state["projection.weight"].shape[0]) if is_student else 768
+                )
+                encoder = self._build_encoder(
+                    config, student=is_student, projection_dim=projection_dim
+                )
+
+                if is_student:
+                    # Новые веса сохранены в fp16. На CPU половина операций
+                    # LayerNorm/Linear либо медленнее, либо не реализована,
+                    # поэтому приводим к float32. Файл небольшой — 236 МБ.
+                    state = {k: v.float() for k, v in state.items()}
+                    encoder.load_state_dict(state, strict=True)
                     del state
+                else:
+                    # Для старого mpnet сохраняем экономию памяти: параметры
+                    # ссылаются прямо на mmap-страницы вместо копирования.
+                    try:
+                        encoder.load_state_dict(state, assign=use_assign)
+                    finally:
+                        del state
 
                 encoder.eval()
                 encoder.to(device)
@@ -546,12 +617,19 @@ class EncoderService:
             return encoder.encode(inputs["input_ids"], inputs["attention_mask"])
 
     def embed(self, texts: Sequence[str]):
-        """Векторы для списка текстов. Требует загруженного кодировщика."""
+        """Нормированные векторы для списка текстов.
+
+        L2-нормализация нужна классификатору типов: он обучался на
+        нормированных эмбеддингах ноутбука №3. Трассировке она не
+        мешает — косинус сам приводит векторы к единичной длине.
+        """
         if not self._loaded and not self.load():
             raise ModelUnavailable(self._error or "unavailable")
-        return self._embed(
+        emb = self._embed(
             self._tokenizer, self._torch, self._device, texts, self._encoder
         )
+        torch = self._torch
+        return torch.nn.functional.normalize(emb, dim=1)
 
     # ---------------- трассировка ----------------
     def link_commit_to_task(

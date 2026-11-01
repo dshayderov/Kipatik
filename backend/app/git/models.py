@@ -342,3 +342,150 @@ class TaskGitLink(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     created_by = relationship("User")
+
+class TaskCommitGrouping(Base):
+    """Служебное состояние группировки коммитов задачи.
+
+    Нужно, чтобы карточка не пересчитывала эмбеддинги при каждом
+    открытии. Одна строка на задачу; при изменении состава связей
+    удаляется, и группы строятся заново.
+    """
+    __tablename__ = "task_commit_groupings"
+
+    task_id = Column(
+        Integer,
+        ForeignKey("tasks.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    # pending | done | empty | error
+    status = Column(String, default="pending", nullable=False)
+    algorithm_version = Column(String, nullable=True)
+    n_commits = Column(Integer, default=0, nullable=False)
+    n_groups = Column(Integer, default=0, nullable=False)
+    n_relations = Column(Integer, default=0, nullable=False)
+    # encoder | lexical | disabled
+    model_used = Column(String, nullable=True)
+    error = Column(Text, nullable=True)
+    generated_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CommitGroup(Base):
+    """Логическая группа коммитов одной задачи.
+
+    Группа создаётся как предложение (`status='proposed'`) и становится
+    подтверждённой только действием человека. Название хранится в двух
+    видах: `title` — готовый текст (для API и ручного редактирования),
+    `title_type`/`title_area` — части шаблона, чтобы интерфейс мог
+    показать название на языке пользователя.
+    """
+    __tablename__ = "commit_groups"
+    __table_args__ = (
+        UniqueConstraint("task_id", "position", name="uq_commit_groups_task_position"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(
+        Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    title = Column(String, nullable=False)
+    # template | manual
+    title_source = Column(String, default="template", nullable=False)
+    title_type = Column(String, nullable=True)
+    title_area = Column(String, nullable=True)
+    description = Column(Text, nullable=True)
+    rationale = Column(Text, nullable=True)
+    confidence = Column(Float, nullable=True)
+
+    # proposed | confirmed
+    status = Column(String, default="proposed", nullable=False)
+    position = Column(Integer, default=0, nullable=False)
+    algorithm_version = Column(String, nullable=True)
+    created_by_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    members = relationship(
+        "CommitGroupMember",
+        back_populates="group",
+        cascade="all, delete-orphan",
+        order_by="CommitGroupMember.position",
+    )
+    created_by = relationship("User")
+
+
+class CommitGroupMember(Base):
+    """Состав группы. Коммит входит не более чем в одну группу задачи."""
+    __tablename__ = "commit_group_members"
+    __table_args__ = (
+        UniqueConstraint("task_id", "commit_id", name="uq_commit_group_members_task_commit"),
+        UniqueConstraint("group_id", "commit_id", name="uq_commit_group_members_group_commit"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(
+        Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    group_id = Column(
+        Integer, ForeignKey("commit_groups.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    commit_id = Column(
+        Integer, ForeignKey("git_commits.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    position = Column(Integer, default=0, nullable=False)
+
+    group = relationship("CommitGroup", back_populates="members")
+    commit = relationship("Commit")
+
+
+class CommitRelation(Base):
+    """Отношение между двумя коммитами задачи.
+
+    Типы: related (связь без уточнения), extends (развитие),
+    fixes (исправление), tests (проверка тестами). Полный набор рёбер
+    хранится для аудита; `in_graph` отмечает рёбра остовного дерева,
+    которые показывает граф группы.
+    """
+    __tablename__ = "commit_relations"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "source_commit_id",
+            "target_commit_id",
+            "relation_type",
+            name="uq_commit_relations_task_pair_type",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(
+        Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_commit_id = Column(
+        Integer, ForeignKey("git_commits.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    target_commit_id = Column(
+        Integer, ForeignKey("git_commits.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    relation_type = Column(String, nullable=False)
+    confidence = Column(Float, default=0.0, nullable=False)
+    # known | unknown — направление по времени коммитов
+    direction = Column(String, default="unknown", nullable=False)
+    rule = Column(String, nullable=True)
+    # lr3 | heuristic | mixed
+    type_source = Column(String, default="heuristic", nullable=False)
+    evidence = Column(Text, nullable=True)
+    # proposed | confirmed | rejected
+    status = Column(String, default="proposed", nullable=False)
+    in_graph = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    source_commit = relationship("Commit", foreign_keys=[source_commit_id])
+    target_commit = relationship("Commit", foreign_keys=[target_commit_id])

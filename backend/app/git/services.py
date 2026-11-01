@@ -245,6 +245,7 @@ class TaskLinkingService:
 
         # Проверяем принадлежность задач проекту
         linked: List[int] = []
+        newly_linked: List[int] = []
         for task_id in task_ids:
             res = await db.execute(
                 select(Task).filter(Task.id == task_id, Task.project_id == repo.project_id)
@@ -253,10 +254,19 @@ class TaskLinkingService:
             if task:
                 if commit not in task.commits:
                     task.commits.append(commit)
+                    newly_linked.append(task.id)
                 await TaskLinkingService.record_link(
                     db, task.id, "commit", commit.id, source="regex"
                 )
                 linked.append(task_id)
+
+        if newly_linked:
+            # Новый коммит меняет состав задачи, а значит и готовые
+            # группы. Сбрасываем только изменённые задачи, чтобы не
+            # пересобирать весь проект на каждой синхронизации.
+            from app.git.grouping import invalidate_task_groupings
+
+            await invalidate_task_groupings(db, newly_linked)
 
         await db.commit()
 

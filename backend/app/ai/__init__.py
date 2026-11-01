@@ -6,10 +6,11 @@
                 модель трассировки (лабораторная работа №1), модель
                 типов коммитов (лабораторная работа №3) и маршруты
   code_model/   артефакты и модуль правил:
-                  commit_tracer.pt                        веса трассировки
+                  student_model_fp16.pt                   веса трассировки
                   type_classifier.pt                      веса типов
                   progress_estimator.py                   модуль правил
-                  paraphrase-multilingual-mpnet-base-v2/  конфиг и словарь
+                  student_model/                          конфиг и словарь
+                  commit_tracer.pt                        старый резерв
   task_model/   зарезервирован под модель анализа задач, пока пуст
 
 Что уехало из папки и почему
